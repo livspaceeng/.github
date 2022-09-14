@@ -1,0 +1,8 @@
+{
+    "name": "Livspace Engg. Sonar Workflow",
+    "description": "Central Sonar Workflow",
+    "iconName": "sonarqube",
+    "filePatterns": [
+        "sonar-project.properties$"
+    ]
+}
