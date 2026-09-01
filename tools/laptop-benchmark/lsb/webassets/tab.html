@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tab</title>
+<style>
+  body{margin:0;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:#fff;color:#202124}
+  header{position:sticky;top:0;background:#fff;border-bottom:1px solid #dadce0;padding:12px 16px;
+         font-weight:600;display:flex;gap:12px;align-items:baseline}
+  header small{font-weight:400;color:#5f6368}
+  .row{display:grid;grid-template-columns:24px 180px 1fr 90px;gap:12px;padding:9px 16px;
+       border-bottom:1px solid #f1f3f4;align-items:center}
+  .row:nth-child(odd){background:#fafafa}
+  .dot{width:9px;height:9px;border-radius:50%;background:#1a73e8}
+  .b{height:9px;border-radius:4px;background:linear-gradient(90deg,#e8f0fe,#c6dafc)}
+</style>
+<header><span id="t">Tab</span> <small id="s">initialising…</small></header>
+<main id="list"></main>
+<script>
+"use strict";
+// Emulates a heavy Google-app tab (Gmail / Docs / Sheets / Analytics): a large
+// retained JS heap, a few thousand live DOM nodes, and periodic mutation that
+// forces real style, layout and paint work.
+//
+// Background tabs are throttled by Chrome exactly as real tabs are; we do not
+// disable that, because the point is to reproduce realistic conditions. The
+// retained heap and DOM stay resident either way, which is what actually
+// competes with CAD for memory.
+
+const Q = new URLSearchParams(location.search);
+const NAME = Q.get("name") || "Tab";
+const HEAP_MB = +(Q.get("mb") || 180);      // retained heap target
+const ROWS = +(Q.get("rows") || 900);       // live DOM rows
+const TICK_MS = +(Q.get("tick") || 1500);   // mutation cadence
+
+document.title = NAME;
+document.getElementById("t").textContent = NAME;
+
+/* ---- retained heap: strings + typed arrays, resistant to dedup ---- */
+const ballast = [];
+(function allocate() {
+  const CHUNK = 1 << 20;                     // 1 MiB per chunk
+  const target = HEAP_MB;
+  for (let i = 0; i < target; i++) {
+    const buf = new Uint8Array(CHUNK);
+    // Fill with non-uniform data so memory compression cannot collapse it —
+    // this is the difference between a fake and a real memory footprint.
+    for (let j = 0; j < CHUNK; j += 64) buf[j] = (i * 31 + j * 17) & 0xff;
+    ballast.push(buf);
+  }
+})();
+
+/* ---- live DOM ---- */
+const list = document.getElementById("list");
+const SUBJECTS = ["Q3 planning", "Design review", "Vendor quote", "Site measurement",
+  "Renders v4", "BOQ update", "Client feedback", "Install schedule", "Material list"];
+const rows = [];
+const frag = document.createDocumentFragment();
+for (let i = 0; i < ROWS; i++) {
+  const el = document.createElement("div");
+  el.className = "row";
+  el.innerHTML = `<span class="dot"></span><span class="n"></span><span class="b"></span><span class="d"></span>`;
+  frag.appendChild(el);
+  rows.push(el);
+}
+list.appendChild(frag);
+
+/* ---- periodic work: JSON churn + DOM mutation + forced layout ---- */
+let ticks = 0, model = [];
+function tick() {
+  ticks++;
+  // App-style serialisation round-trip.
+  model = [];
+  for (let i = 0; i < 400; i++) {
+    model.push({ id: i, s: SUBJECTS[(i + ticks) % SUBJECTS.length],
+                 v: Math.random(), tags: ["a", "b", "c"].slice(0, i % 3 + 1) });
+  }
+  const parsed = JSON.parse(JSON.stringify(model));
+
+  const n = Math.min(rows.length, 250);
+  for (let i = 0; i < n; i++) {
+    const r = rows[(i * 7 + ticks * 13) % rows.length];
+    const rec = parsed[i % parsed.length];
+    r.children[1].textContent = rec.s + " #" + rec.id;
+    r.children[2].style.width = (20 + rec.v * 70).toFixed(1) + "%";
+    r.children[3].textContent = new Date(Date.now() - rec.id * 6e4).toLocaleTimeString();
+  }
+  void list.offsetHeight;                    // force synchronous layout
+
+  const mem = performance.memory
+    ? { js_heap_mb: +(performance.memory.usedJSHeapSize / 1048576).toFixed(1) } : {};
+  document.getElementById("s").textContent =
+    `${ballast.length} MiB ballast · ${rows.length} rows · tick ${ticks}` +
+    (mem.js_heap_mb ? ` · heap ${mem.js_heap_mb} MB` : "");
+
+  const body = JSON.stringify(Object.assign(
+    { kind: "tab", name: NAME, ticks, rows: rows.length, ballast_mb: ballast.length }, mem));
+  try {
+    if (!navigator.sendBeacon || !navigator.sendBeacon("/report", body)) {
+      fetch("/report", { method: "POST", body, keepalive: true }).catch(() => {});
+    }
+  } catch (_) {}
+}
+tick();
+setInterval(tick, TICK_MS);
+</script>

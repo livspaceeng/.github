@@ -1,0 +1,240 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>3D Simulator Load</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;
+    font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;top:10px;left:10px;padding:8px 12px;background:rgba(0,0,0,.6);
+    border-radius:6px;white-space:pre;font-variant-numeric:tabular-nums;pointer-events:none}
+  #err{position:fixed;inset:0;display:none;place-items:center;padding:40px;text-align:center;color:#f85149}
+</style>
+<canvas id="c"></canvas>
+<div id="hud">starting…</div>
+<div id="err"></div>
+<script>
+"use strict";
+// Standalone WebGL scene approximating a browser-based 3D configurator /
+// simulator: a few dozen shaded objects, one draw call each, redrawn every
+// frame. No external libraries so it runs offline and behind a proxy.
+
+const Q = new URLSearchParams(location.search);
+const OBJECTS = +(Q.get("objects") || 28);   // draw calls per frame
+const SEG     = +(Q.get("seg") || 96);       // sphere tessellation
+const SCALE   = +(Q.get("res") || 1);        // render-scale multiplier
+const REPORT_MS = 1000;
+
+const canvas = document.getElementById("c");
+const hud = document.getElementById("hud");
+
+function fatal(msg) {
+  const e = document.getElementById("err");
+  e.style.display = "grid";
+  e.textContent = msg;
+  post({ kind: "sim", error: msg });
+}
+
+function post(payload) {
+  payload.ts = Date.now();
+  try {
+    const body = JSON.stringify(payload);
+    if (!navigator.sendBeacon || !navigator.sendBeacon("/report", body)) {
+      fetch("/report", { method: "POST", body, keepalive: true }).catch(() => {});
+    }
+  } catch (_) { /* reporting must never break the render loop */ }
+}
+
+const gl = canvas.getContext("webgl", { antialias: true, powerPreference: "high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) fatal("WebGL is unavailable in this browser/profile — GPU load cannot be measured.");
+
+/* ---------- geometry: UV sphere ---------- */
+function sphere(seg) {
+  const pos = [], nrm = [], idx = [];
+  for (let y = 0; y <= seg; y++) {
+    const v = y / seg, phi = v * Math.PI;
+    for (let x = 0; x <= seg; x++) {
+      const u = x / seg, theta = u * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      // Light surface displacement keeps the vertex shader honest.
+      const r = 1 + 0.08 * Math.sin(6 * theta) * Math.sin(6 * phi);
+      pos.push(nx * r, ny * r, nz * r);
+      nrm.push(nx, ny, nz);
+    }
+  }
+  const row = seg + 1;
+  for (let y = 0; y < seg; y++) {
+    for (let x = 0; x < seg; x++) {
+      const a = y * row + x, b = a + row;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm), idx: new Uint32Array(idx) };
+}
+
+const uintExt = gl.getExtension("OES_element_index_uint");
+const geo = sphere(uintExt ? SEG : Math.min(SEG, 60));
+const indexType = uintExt ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+const indices = uintExt ? geo.idx : new Uint16Array(geo.idx);
+const TRIS = indices.length / 3;
+
+/* ---------- shaders ---------- */
+const VS = `
+attribute vec3 aPos; attribute vec3 aNrm;
+uniform mat4 uProj, uView, uModel;
+uniform float uTime;
+varying vec3 vN; varying vec3 vP;
+void main() {
+  vec3 p = aPos * (1.0 + 0.05 * sin(uTime + aPos.y * 4.0));
+  vec4 world = uModel * vec4(p, 1.0);
+  vP = world.xyz;
+  vN = mat3(uModel) * aNrm;
+  gl_Position = uProj * uView * world;
+}`;
+
+const FS = `
+precision highp float;
+varying vec3 vN; varying vec3 vP;
+uniform vec3 uColor; uniform float uTime;
+void main() {
+  vec3 N = normalize(vN);
+  vec3 L = normalize(vec3(sin(uTime * 0.3), 0.9, cos(uTime * 0.3)));
+  vec3 V = normalize(-vP);
+  vec3 H = normalize(L + V);
+  float diff = max(dot(N, L), 0.0);
+  float spec = pow(max(dot(N, H), 0.0), 48.0);
+  float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+  vec3 col = uColor * (0.15 + 0.85 * diff) + vec3(spec) * 0.6 + vec3(0.1, 0.2, 0.4) * rim;
+  gl_FragColor = vec4(pow(col, vec3(0.4545)), 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    fatal("shader compile failed: " + gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) fatal("link failed: " + gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+function buffer(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+const aPos = gl.getAttribLocation(prog, "aPos");
+const aNrm = gl.getAttribLocation(prog, "aNrm");
+const posBuf = buffer(gl.ARRAY_BUFFER, geo.pos);
+const nrmBuf = buffer(gl.ARRAY_BUFFER, geo.nrm);
+buffer(gl.ELEMENT_ARRAY_BUFFER, indices);
+
+const U = {};
+for (const n of ["uProj", "uView", "uModel", "uColor", "uTime"]) U[n] = gl.getUniformLocation(prog, n);
+
+/* ---------- tiny matrix helpers ---------- */
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);
+}
+function lookAtZ(dist) {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-dist,1]);
+}
+function modelMatrix(tx, ty, tz, rx, ry, s) {
+  const cx=Math.cos(rx), sx=Math.sin(rx), cy=Math.cos(ry), sy=Math.sin(ry);
+  // Ry * Rx, uniformly scaled, then translated.
+  return new Float32Array([
+    cy*s, 0, -sy*s, 0,
+    sy*sx*s, cx*s, cy*sx*s, 0,
+    sy*cx*s, -sx*s, cy*cx*s, 0,
+    tx, ty, tz, 1,
+  ]);
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2) * SCALE;
+  canvas.width = Math.max(320, Math.floor(canvas.clientWidth * dpr));
+  canvas.height = Math.max(240, Math.floor(canvas.clientHeight * dpr));
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener("resize", resize);
+resize();
+
+gl.enable(gl.DEPTH_TEST);
+gl.clearColor(0.05, 0.06, 0.08, 1);
+
+/* ---------- render loop ---------- */
+let frames = 0, totalFrames = 0, last = performance.now(), windowStart = last;
+let times = [], jank = 0, started = performance.now();
+
+function frame(now) {
+  const dt = now - last;
+  last = now;
+  times.push(dt);
+  if (dt > 33.34) jank++;
+  frames++; totalFrames++;
+
+  const t = (now - started) / 1000;
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.uniformMatrix4fv(U.uProj, false, perspective(1.0, canvas.width / canvas.height, 0.1, 100));
+  gl.uniformMatrix4fv(U.uView, false, lookAtZ(9));
+  gl.uniform1f(U.uTime, t);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
+  gl.enableVertexAttribArray(aNrm); gl.vertexAttribPointer(aNrm, 3, gl.FLOAT, false, 0, 0);
+
+  for (let i = 0; i < OBJECTS; i++) {
+    const a = (i / OBJECTS) * Math.PI * 2 + t * 0.25;
+    const ring = 3.2 + 1.4 * Math.sin(i * 1.7);
+    gl.uniformMatrix4fv(U.uModel, false, modelMatrix(
+      Math.cos(a) * ring, Math.sin(a * 1.3) * 1.6, Math.sin(a) * ring,
+      t * 0.7 + i, t * 0.5 + i * 0.3, 0.55,
+    ));
+    gl.uniform3f(U.uColor, 0.35 + 0.4 * Math.sin(i), 0.45, 0.55 + 0.4 * Math.cos(i * 0.7));
+    gl.drawElements(gl.TRIANGLES, indices.length, indexType, 0);
+  }
+
+  if (now - windowStart >= REPORT_MS) {
+    const secs = (now - windowStart) / 1000;
+    const sorted = times.slice().sort((a, b) => a - b);
+    const p = q => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] : 0;
+    const fps = frames / secs;
+    const payload = {
+      kind: "sim", fps: +fps.toFixed(2),
+      frame_ms_avg: +(times.reduce((a, b) => a + b, 0) / times.length).toFixed(2),
+      frame_ms_p95: +p(0.95).toFixed(2),
+      frame_ms_max: +p(1).toFixed(2),
+      jank_frames: jank, frames: totalFrames,
+      draw_calls: OBJECTS, tris_per_frame: TRIS * OBJECTS,
+      w: canvas.width, h: canvas.height,
+    };
+    post(payload);
+    hud.textContent =
+      `FPS ${fps.toFixed(1)}   frame ${payload.frame_ms_avg}ms (p95 ${payload.frame_ms_p95})\n` +
+      `${OBJECTS} draws x ${(TRIS / 1000).toFixed(0)}k tris = ${(payload.tris_per_frame / 1e6).toFixed(2)}M tris/frame\n` +
+      `${canvas.width}x${canvas.height}   jank ${jank}`;
+    frames = 0; jank = 0; times = []; windowStart = now;
+  }
+  requestAnimationFrame(frame);
+}
+
+if (gl) {
+  post({ kind: "sim", event: "ready", tris_per_frame: TRIS * OBJECTS, draw_calls: OBJECTS,
+         renderer: (() => { const e = gl.getExtension("WEBGL_debug_renderer_info");
+                            return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : "unknown"; })() });
+  requestAnimationFrame(frame);
+}
+</script>
