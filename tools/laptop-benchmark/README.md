@@ -32,6 +32,18 @@ Other profiles:
 ./run.sh --profile max        # ~12 min - stability ceiling, not a realistic load
 ```
 
+## Two tools, two questions
+
+| Tool | Question it answers |
+| --- | --- |
+| `./run.sh` (this directory) | *What can this machine do?* Synthetic CAD + 3D + tabs load, with full system telemetry. |
+| [`realapp/`](realapp/) | *What does the real app actually achieve on it?* Measures Livspace Parametric, Coohom or any WebGL app live in your own logged-in browser session. |
+
+For a procurement or "is my laptop the problem?" decision, run both. The
+synthetic benchmark establishes the machine's ceiling; the real-app probe shows
+how much of that ceiling the application reaches, and which limit it hits
+first — GPU, main-thread JavaScript, or memory.
+
 ## Requirements
 
 - macOS 12+ on Apple Silicon (primary target), or Linux
