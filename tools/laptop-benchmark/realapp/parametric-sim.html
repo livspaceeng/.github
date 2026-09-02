@@ -56,10 +56,10 @@
  */
 
 var LEVELS = [
-  { name: "Low",    modules: 8,  panels: 3, tex: 512,  res: 0.75 },
-  { name: "Medium", modules: 16, panels: 4, tex: 1024, res: 1.0  },
-  { name: "High",   modules: 28, panels: 5, tex: 1024, res: 1.0  },
-  { name: "Ultra",  modules: 44, panels: 6, tex: 2048, res: 1.0  },
+  { name: "Low",    modules: 8,  panels: 3, tex: 512,  res: 0.75, tess: 8,  ptess: 6,  shell: 24 },
+  { name: "Medium", modules: 16, panels: 4, tex: 1024, res: 1.0,  tess: 12, ptess: 10, shell: 40 },
+  { name: "High",   modules: 28, panels: 5, tex: 1024, res: 1.0,  tess: 16, ptess: 12, shell: 56 },
+  { name: "Ultra",  modules: 44, panels: 6, tex: 2048, res: 1.0,  tess: 24, ptess: 16, shell: 72 },
 ];
 var SECONDS_PER_LEVEL = +(new URLSearchParams(location.search).get("secs") || 20);
 var WARMUP_MS = 1500;
@@ -77,28 +77,106 @@ var RENDERER = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "unknown";
 var SOFTWARE = /swiftshader|llvmpipe|software|basic render/i.test(RENDERER);
 
 /* ------------------------------------------------ geometry helpers */
-function box(w, h, d) {
-  var x = w / 2, y = h / 2, z = d / 2;
-  var p = [], n = [], t = [], i = [];
+/* Furniture is modelled with real tessellation - rounded-edge panels and
+ * turned handles - so the vertex pipeline carries a load comparable to a
+ * production configurator, not a placeholder cube. */
+
+function roundedBox(w, h, d, seg, r) {
+  var hx = w/2, hy = h/2, hz = d/2;
+  r = Math.min(r, Math.min(hx, Math.min(hy, hz)) * 0.9);
+  var ix = hx - r, iy = hy - r, iz = hz - r;
+  var pos = [], nrm = [], uv = [], idx = [];
   var faces = [
-    [[-x,-y, z],[ x,-y, z],[ x, y, z],[-x, y, z],[ 0, 0, 1]],
-    [[ x,-y,-z],[-x,-y,-z],[-x, y,-z],[ x, y,-z],[ 0, 0,-1]],
-    [[-x, y, z],[ x, y, z],[ x, y,-z],[-x, y,-z],[ 0, 1, 0]],
-    [[-x,-y,-z],[ x,-y,-z],[ x,-y, z],[-x,-y, z],[ 0,-1, 0]],
-    [[ x,-y, z],[ x,-y,-z],[ x, y,-z],[ x, y, z],[ 1, 0, 0]],
-    [[-x,-y,-z],[-x,-y, z],[-x, y, z],[-x, y,-z],[-1, 0, 0]],
+    { ax:[1,0,0],  ay:[0,1,0],  n:[0,0,1]  },
+    { ax:[-1,0,0], ay:[0,1,0],  n:[0,0,-1] },
+    { ax:[1,0,0],  ay:[0,0,-1], n:[0,1,0]  },
+    { ax:[1,0,0],  ay:[0,0,1],  n:[0,-1,0] },
+    { ax:[0,0,-1], ay:[0,1,0],  n:[1,0,0]  },
+    { ax:[0,0,1],  ay:[0,1,0],  n:[-1,0,0] },
   ];
-  faces.forEach(function (f, fi) {
-    var base = fi * 4;
-    for (var k = 0; k < 4; k++) {
-      p.push(f[k][0], f[k][1], f[k][2]);
-      n.push(f[4][0], f[4][1], f[4][2]);
+  function ext(v) { return Math.abs(v[0])*hx + Math.abs(v[1])*hy + Math.abs(v[2])*hz; }
+
+  for (var fi = 0; fi < faces.length; fi++) {
+    var f = faces[fi], base = pos.length / 3;
+    var ea = ext(f.ax), eb = ext(f.ay), en = ext(f.n);
+    for (var j = 0; j <= seg; j++) {
+      for (var i = 0; i <= seg; i++) {
+        var u = i / seg * 2 - 1, v = j / seg * 2 - 1;
+        var px = f.ax[0]*u*ea + f.ay[0]*v*eb + f.n[0]*en;
+        var py = f.ax[1]*u*ea + f.ay[1]*v*eb + f.n[1]*en;
+        var pz = f.ax[2]*u*ea + f.ay[2]*v*eb + f.n[2]*en;
+        // Project onto the rounded shell: clamp into the inner box, then push
+        // out by the corner radius along the offset direction.
+        var cx = Math.max(-ix, Math.min(ix, px));
+        var cy = Math.max(-iy, Math.min(iy, py));
+        var cz = Math.max(-iz, Math.min(iz, pz));
+        var dx = px - cx, dy = py - cy, dz = pz - cz;
+        var L = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1;
+        dx /= L; dy /= L; dz /= L;
+        pos.push(cx + dx*r, cy + dy*r, cz + dz*r);
+        nrm.push(dx, dy, dz);
+        uv.push(i / seg, j / seg);
+      }
     }
-    t.push(0,0, 1,0, 1,1, 0,1);
-    i.push(base, base+1, base+2, base, base+2, base+3);
+    var row = seg + 1;
+    for (var y = 0; y < seg; y++) {
+      for (var x = 0; x < seg; x++) {
+        var a = base + y*row + x, b = a + row;
+        idx.push(a, b, a+1, a+1, b, b+1);
+      }
+    }
+  }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm),
+           uv: new Float32Array(uv), idx: new Uint16Array(idx) };
+}
+
+function cylinder(r, h, seg) {
+  var pos = [], nrm = [], uv = [], idx = [];
+  for (var i = 0; i <= seg; i++) {
+    var a = i / seg * Math.PI * 2, c = Math.cos(a), s2 = Math.sin(a);
+    pos.push(c*r, -h/2, s2*r); nrm.push(c, 0, s2); uv.push(i/seg, 0);
+    pos.push(c*r,  h/2, s2*r); nrm.push(c, 0, s2); uv.push(i/seg, 1);
+  }
+  for (var k = 0; k < seg; k++) {
+    var b = k * 2;
+    idx.push(b, b+1, b+2, b+2, b+1, b+3);
+  }
+  // Caps.
+  [-1, 1].forEach(function (sign) {
+    var centre = pos.length / 3;
+    pos.push(0, sign*h/2, 0); nrm.push(0, sign, 0); uv.push(0.5, 0.5);
+    for (var i = 0; i <= seg; i++) {
+      var a = i / seg * Math.PI * 2;
+      pos.push(Math.cos(a)*r, sign*h/2, Math.sin(a)*r);
+      nrm.push(0, sign, 0);
+      uv.push(0.5 + Math.cos(a)*0.5, 0.5 + Math.sin(a)*0.5);
+    }
+    for (var i2 = 0; i2 < seg; i2++) {
+      if (sign > 0) idx.push(centre, centre+1+i2, centre+2+i2);
+      else idx.push(centre, centre+2+i2, centre+1+i2);
+    }
   });
-  return { pos: new Float32Array(p), nrm: new Float32Array(n),
-           uv: new Float32Array(t), idx: new Uint16Array(i) };
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm),
+           uv: new Float32Array(uv), idx: new Uint16Array(idx) };
+}
+
+function plane(seg) {
+  var pos = [], nrm = [], uv = [], idx = [];
+  for (var j = 0; j <= seg; j++) {
+    for (var i = 0; i <= seg; i++) {
+      pos.push(i/seg - 0.5, 0, j/seg - 0.5);
+      nrm.push(0, 1, 0);
+      uv.push(i/seg, j/seg);
+    }
+  }
+  var row = seg + 1;
+  for (var y = 0; y < seg; y++)
+    for (var x = 0; x < seg; x++) {
+      var a = y*row + x, b = a + row;
+      idx.push(a, b, a+1, a+1, b, b+1);
+    }
+  return { pos: new Float32Array(pos), nrm: new Float32Array(nrm),
+           uv: new Float32Array(uv), idx: new Uint16Array(idx) };
 }
 
 function makeBuffers(g) {
@@ -111,6 +189,11 @@ function makeBuffers(g) {
     uv: buf(gl.ARRAY_BUFFER, g.uv), idx: buf(gl.ELEMENT_ARRAY_BUFFER, g.idx),
     count: g.idx.length, tris: g.idx.length / 3,
   };
+}
+
+function freeBuffers(m) {
+  if (!m) return;
+  [m.pos, m.nrm, m.uv, m.idx].forEach(function (b) { gl.deleteBuffer(b); });
 }
 
 /* ---------------------------------------------------- procedural textures */
@@ -218,23 +301,37 @@ function model(tx,ty,tz, sx,sy,sz, ry){
 }
 
 /* ------------------------------------------------------------- the scene */
-var unit = makeBuffers(box(1,1,1));
-var scene = [];        // {m: mat4, tint, tex, repeat}
+var MESH = null;       // per-level tessellated meshes
+var scene = [];        // {mesh, m: mat4, tint, tex, repeat}
 var boqRows = [];
+
+function buildMeshes(level) {
+  if (MESH) ["carcass","panel","handle","shell"].forEach(function(k){ freeBuffers(MESH[k]); });
+  MESH = {
+    carcass: makeBuffers(roundedBox(1, 1, 1, level.tess, 0.045)),
+    panel:   makeBuffers(roundedBox(1, 1, 1, level.ptess, 0.06)),
+    handle:  makeBuffers(cylinder(0.5, 1, 20)),
+    shell:   makeBuffers(plane(level.shell)),
+  };
+}
 
 function buildScene(level) {
   scene = []; boqRows = [];
+  buildMeshes(level);
   var T = level.tex;
   var floorTex = laminate(T, 28), wallTex = laminate(T, 40);
-  // Room shell.
-  scene.push({ m: model(0,-0.05,0, 16,0.1,12, 0), tint:[0.85,0.78,0.70], tex:floorTex, repeat:6 });
-  scene.push({ m: model(0,2.5,-6, 16,5,0.15, 0),  tint:[0.93,0.92,0.90], tex:wallTex, repeat:5 });
-  scene.push({ m: model(-8,2.5,0, 0.15,5,12, 0),  tint:[0.93,0.92,0.90], tex:wallTex, repeat:5 });
-  scene.push({ m: model(8,2.5,0, 0.15,5,12, 0),   tint:[0.90,0.89,0.88], tex:wallTex, repeat:5 });
+  // Room shell - subdivided planes, so wall and floor shading is interpolated
+  // across real geometry rather than two giant triangles.
+  scene.push({ mesh: MESH.shell, m: model(0,0,0, 16,1,12, 0),
+               tint:[0.85,0.78,0.70], tex:floorTex, repeat:6 });
+  scene.push({ mesh: MESH.carcass, m: model(0,2.5,-6, 16,5,0.15, 0),
+               tint:[0.93,0.92,0.90], tex:wallTex, repeat:5 });
+  scene.push({ mesh: MESH.carcass, m: model(-8,2.5,0, 0.15,5,12, 0),
+               tint:[0.93,0.92,0.90], tex:wallTex, repeat:5 });
+  scene.push({ mesh: MESH.carcass, m: model(8,2.5,0, 0.15,5,12, 0),
+               tint:[0.90,0.89,0.88], tex:wallTex, repeat:5 });
 
-  for (var i = 0; i < level.modules; i++) {
-    addModule(i, level, false);
-  }
+  for (var i = 0; i < level.modules; i++) addModule(i, level, false);
   renderBoq();
 }
 
@@ -246,13 +343,14 @@ function addModule(i, level, isNew) {
   var col = Math.floor(i / 3), row = i % 3;
   var bx = -7 + col * 2.1, bz = -5 + row * 3.4;
   var h = 2.0 + (i % 3) * 0.35;
-  scene.push({ m: model(bx, h/2, bz, 1.7, h, 0.62, (i%4)*0.08),
+  scene.push({ mesh: MESH.carcass, m: model(bx, h/2, bz, 1.7, h, 0.62, (i%4)*0.08),
                tint: [0.92,0.88,0.84], tex: tex, repeat: 2 });
   for (var p = 0; p < level.panels; p++) {
     var py = 0.22 + p * (h - 0.3) / level.panels;
-    scene.push({ m: model(bx, py, bz + 0.33, 1.55, (h-0.3)/level.panels - 0.05, 0.05, (i%4)*0.08),
+    scene.push({ mesh: MESH.panel,
+                 m: model(bx, py, bz + 0.33, 1.55, (h-0.3)/level.panels - 0.05, 0.05, (i%4)*0.08),
                  tint: [1.0,0.97,0.93], tex: tex, repeat: 1 });
-    scene.push({ m: model(bx + 0.62, py, bz + 0.40, 0.10, 0.10, 0.10, 0),
+    scene.push({ mesh: MESH.handle, m: model(bx + 0.62, py, bz + 0.40, 0.05, 0.34, 0.05, 0),
                  tint: [0.55,0.57,0.60], tex: tex, repeat: 1 });
   }
   boqRows.push({ name: ["Wardrobe","Base unit","Wall unit","Tall unit","Dresser"][i%5] + " " + (i+1),
@@ -367,7 +465,11 @@ function frame(now) {
     M.spikes = []; M.longTasks = []; M.nextSpike = now + SPIKE_EVERY_MS;
   }
   if (M.phase === "measure") {
-    if (dt > 0 && dt < 5000) { M.frames++; M.times.push(dt); }
+    // Count every rendered frame, so per-frame geometry figures stay correct
+    // even when a frame takes seconds. Only feed sane deltas to the timing
+    // statistics, so one enormous outlier cannot distort the percentiles.
+    M.frames++;
+    if (dt > 0 && dt < 5000) M.times.push(dt);
     if (now >= M.nextSpike) { spike(); M.nextSpike = performance.now() + SPIKE_EVERY_MS; }
   }
 
@@ -381,22 +483,28 @@ function frame(now) {
   gl.uniform1i(U.uTex, 0);
   gl.activeTexture(gl.TEXTURE0);
 
-  gl.bindBuffer(gl.ARRAY_BUFFER, unit.pos);
-  gl.enableVertexAttribArray(A.pos); gl.vertexAttribPointer(A.pos,3,gl.FLOAT,false,0,0);
-  gl.bindBuffer(gl.ARRAY_BUFFER, unit.nrm);
-  gl.enableVertexAttribArray(A.nrm); gl.vertexAttribPointer(A.nrm,3,gl.FLOAT,false,0,0);
-  gl.bindBuffer(gl.ARRAY_BUFFER, unit.uv);
-  gl.enableVertexAttribArray(A.uv); gl.vertexAttribPointer(A.uv,2,gl.FLOAT,false,0,0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, unit.idx);
-
+  gl.enableVertexAttribArray(A.pos);
+  gl.enableVertexAttribArray(A.nrm);
+  gl.enableVertexAttribArray(A.uv);
+  var boundMesh = null;
   for (var i = 0; i < scene.length; i++) {
     var o = scene[i];
+    if (o.mesh !== boundMesh) {
+      boundMesh = o.mesh;
+      gl.bindBuffer(gl.ARRAY_BUFFER, boundMesh.pos);
+      gl.vertexAttribPointer(A.pos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, boundMesh.nrm);
+      gl.vertexAttribPointer(A.nrm, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, boundMesh.uv);
+      gl.vertexAttribPointer(A.uv, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boundMesh.idx);
+    }
     gl.bindTexture(gl.TEXTURE_2D, o.tex);
     gl.uniformMatrix4fv(U.uModel, false, o.m);
     gl.uniform3f(U.uTint, o.tint[0], o.tint[1], o.tint[2]);
     gl.uniform1f(U.uRepeat, o.repeat);
-    gl.drawElements(gl.TRIANGLES, unit.count, gl.UNSIGNED_SHORT, 0);
-    if (M.phase === "measure") { M.drawCalls++; M.tris += unit.tris; }
+    gl.drawElements(gl.TRIANGLES, o.mesh.count, gl.UNSIGNED_SHORT, 0);
+    if (M.phase === "measure") { M.drawCalls++; M.tris += o.mesh.tris; }
   }
 
   var fps = M.times.length ? (1000 / (M.times.reduce(function(x,y){return x+y;},0) / M.times.length)) : 0;
@@ -405,8 +513,9 @@ function frame(now) {
     "   " + (M.phase === "warmup" ? "warming up" : Math.max(0,(SECONDS_PER_LEVEL*1000-elapsed)/1000).toFixed(0)+"s") + "\n" +
     "FPS " + fps.toFixed(1) + "   frame " + (M.times.length?pctl(M.times,50).toFixed(1):0) +
     "ms  p95 " + (M.times.length?pctl(M.times,95).toFixed(1):0) + "ms\n" +
-    scene.length + " draw calls   " + canvas.width + "x" + canvas.height +
-    "   " + lv.tex + "px textures\n" +
+    scene.length + " draw calls   " +
+    (scene.reduce(function(a,o){return a+o.mesh.tris;},0)/1e6).toFixed(2) + "M tris   " +
+    canvas.width + "x" + canvas.height + "   " + lv.tex + "px textures\n" +
     "add-module stalls: " + M.spikes.length + (M.spikes.length ? "  worst " + Math.max.apply(null,M.spikes).toFixed(0) + "ms" : "");
 
   if (M.phase === "measure" && elapsed >= SECONDS_PER_LEVEL * 1000) {
@@ -483,10 +592,16 @@ function report() {
   else add("ok", "Edits apply without a visible pause",
     "Worst synchronous stall " + worstSpike + " ms.");
 
-  var scale = R[0].fps_mean && top.fps_mean ? (R[0].fps_mean / top.fps_mean) : 0;
-  if (scale > 3) add("warn", "Performance falls away steeply with scene size",
-    "Low is " + scale.toFixed(1) + "x faster than Ultra. This machine is sensitive to design " +
-    "complexity: large projects will degrade fast.");
+  if (top.fps_mean < 1) {
+    add("fail", "Heaviest preset did not render",
+      "Ultra managed under 1 fps, so no meaningful timing could be collected at that level. " +
+      "Treat " + (holds30 || "nothing below it") + " as this machine's practical ceiling.");
+  } else {
+    var scale = R[0].fps_mean / top.fps_mean;
+    if (scale > 3) add("warn", "Performance falls away steeply with scene size",
+      "Low is " + scale.toFixed(1) + "x faster than Ultra. This machine is sensitive to design " +
+      "complexity: large projects will degrade fast.");
+  }
 
   var order = { fail:0, warn:1, ok:2 };
   findings.sort(function(a,b){return order[a.l]-order[b.l];});

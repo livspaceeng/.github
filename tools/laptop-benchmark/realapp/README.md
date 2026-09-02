@@ -22,6 +22,9 @@ What it reproduces, deliberately:
 
 - A room shell plus many separately-drawn furniture modules — 67 draw calls at
   Low rising to 589 at Ultra. Configurators batch poorly, and that is the point.
+- Real tessellated geometry: rounded-edge carcasses and door panels, turned
+  handles, subdivided walls and floor. 0.02M triangles per frame at Low rising
+  to **1.18M at Ultra**, which is the range a production configurator occupies.
 - Textured, specular, normal-perturbed surfaces with three point lights, so
   fragment cost is realistic rather than a flat colour the GPU shrugs off.
 - A continuously orbiting camera, as a user inspecting a design.
