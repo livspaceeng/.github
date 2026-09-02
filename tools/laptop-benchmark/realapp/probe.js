@@ -56,6 +56,7 @@
     label: "idle",
     hidden: [],              // [{from, to}] seconds the tab was in the background
     hiddenSince: null,
+    lastHeartbeat: 0,
   };
 
   // Chrome stops requestAnimationFrame for a hidden tab. Without this the
@@ -199,7 +200,13 @@
     S.lastFrame = now;
     if (dt > 0 && dt < 5000) {
       S.frames++;
-      S.frameTimes.push(dt);
+      // Reservoir-sample once the array is large, so an hours-long capture
+      // cannot grow without bound while the percentiles stay representative.
+      if (S.frameTimes.length < 300000) S.frameTimes.push(dt);
+      else {
+        var r = Math.floor(Math.random() * S.frames);
+        if (r < 300000) S.frameTimes[r] = dt;
+      }
       S.bucketTimes.push(dt);
     }
 
@@ -228,6 +235,15 @@
       S.bucketStart = now;
     }
 
+    var mins = Math.floor((now - S.t0) / 60000);
+    if (mins > S.lastHeartbeat) {
+      S.lastHeartbeat = mins;
+      var hb = summarise();
+      console.log("[lsprobe] " + mins + " min — " + hb.active_fps_p50 + " fps while rendering, " +
+        hb.active_draws_per_frame.toLocaleString() + " draws/frame, heap " +
+        Math.round(hb.heap_mb_peak || 0) + " MB, " + hb.frozen_seconds + "s hung" +
+        (hb.hidden_seconds > 2 ? ", " + hb.hidden_seconds + "s hidden" : ""));
+    }
     if ((now - S.t0) / 1000 >= CONFIG.durationSeconds) { api.stop(); return; }
     S.raf = requestAnimationFrame(tick);
   }
@@ -292,6 +308,44 @@
     return { hangs: hangs, hidden: hiddenGaps };
   }
 
+  // Least-squares slope of heap over time, plus a first-third / last-third
+  // comparison. A long capture is the only way to tell a leak from a plateau.
+  function heapTrend() {
+    // Measure growth per minute of foreground time. Wall clock would let a
+    // long spell in the background flatten a real leak into a gentle slope.
+    function foregroundAt(t) {
+      var hid = 0;
+      S.hidden.forEach(function (h) { hid += Math.max(0, Math.min(t, h.to) - h.from); });
+      return t - hid;
+    }
+    var pts = S.buckets
+      .filter(function (b) {
+        if (!b.heapMb) return false;
+        return !S.hidden.some(function (h) { return b.t >= h.from && b.t <= h.to; });
+      })
+      .map(function (b) { return [foregroundAt(b.t), b.heapMb]; });
+    if (pts.length < 30) return { measurable: false, reason: "needs a few minutes of data" };
+    var n = pts.length, sx = 0, sy = 0, sxy = 0, sxx = 0;
+    pts.forEach(function (p) { sx += p[0]; sy += p[1]; sxy += p[0] * p[1]; sxx += p[0] * p[0]; });
+    var denom = n * sxx - sx * sx;
+    var slope = denom ? (n * sxy - sx * sy) / denom : 0;   // MB per second
+    var third = Math.floor(n / 3);
+    var firstMed = pct(pts.slice(0, third).map(function (p) { return p[1]; }), 50);
+    var lastMed = pct(pts.slice(-third).map(function (p) { return p[1]; }), 50);
+    var spanMin = (pts[n - 1][0] - pts[0][0]) / 60;
+    return {
+      measurable: true,
+      mb_per_min: +(slope * 60).toFixed(1),
+      first_third_mb: +firstMed.toFixed(0),
+      last_third_mb: +lastMed.toFixed(0),
+      delta_mb: +(lastMed - firstMed).toFixed(0),
+      span_minutes: +spanMin.toFixed(1),
+      // Only call it growth if the trend is both positive and material.
+      verdict: (slope * 60 > 2 && lastMed - firstMed > 100) ? "growing"
+             : (Math.abs(lastMed - firstMed) <= 100) ? "plateaued" : "receding",
+    };
+  }
+
   function summarise() {
     var ft = S.frameTimes;
     var elapsed = (performance.now() - S.t0) / 1000;
@@ -354,6 +408,7 @@
       heap_mb_peak: Math.max.apply(null, [0].concat(
         S.buckets.map(function (b) { return b.heapMb || 0; }))) || null,
       heap_mb_end: S.buckets.length ? S.buckets[S.buckets.length - 1].heapMb : null,
+      heap_trend: heapTrend(),
       device_pixel_ratio: window.devicePixelRatio,
       hardware_concurrency: navigator.hardwareConcurrency,
       device_memory_gb: navigator.deviceMemory || null,
@@ -444,10 +499,23 @@
       else add("ok", "Main thread stays responsive", "Blocked only " + s.blocked_pct + "% of the session.");
     }
 
-    if (s.heap_mb_start && s.heap_mb_peak && s.heap_mb_peak - s.heap_mb_start > 400)
+    var ht = s.heap_trend || {};
+    if (ht.measurable && ht.verdict === "growing") {
+      var hrs = ht.mb_per_min > 0 ? (2048 - s.heap_mb_peak) / ht.mb_per_min / 60 : null;
+      add("fail", "JS heap is growing, not plateauing",
+        "Up " + ht.delta_mb + " MB across " + ht.span_minutes + " minutes on screen, a sustained " +
+        ht.mb_per_min + " MB/min, peak " + Math.round(s.heap_mb_peak) + " MB. This is a retention " +
+        "problem rather than a working set." + (hrs && hrs < 8 ? " At that rate the tab reaches " +
+        "2 GB in roughly " + hrs.toFixed(1) + " hours of use." : ""));
+    } else if (ht.measurable && ht.verdict === "plateaued") {
+      add("ok", "JS heap plateaus",
+        "Settled around " + ht.last_third_mb + " MB over " + ht.span_minutes +
+        " minutes on screen. A working set, not a leak.");
+    } else if (s.heap_mb_start && s.heap_mb_peak && s.heap_mb_peak - s.heap_mb_start > 400) {
       add("warn", "JS heap grew sharply",
         Math.round(s.heap_mb_start) + " MB to a peak of " + Math.round(s.heap_mb_peak) + " MB in " +
-        s.seconds + "s. Worth a longer recording to see whether it plateaus or keeps climbing.");
+        s.seconds + "s. Record for at least five minutes to tell a leak from a working set.");
+    }
 
     if (s.device_pixel_ratio >= 2 && canvas && canvas.w >= 1800)
       add("warn", "Rendering at full Retina resolution",
@@ -532,6 +600,10 @@
           (s.long_task_ms_max / 1000).toFixed(1) + " s" : "not supported"],
       ["JS heap start / peak / end", (s.heap_mb_start || "?") + " / " + Math.round(s.heap_mb_peak || 0) +
         " / " + (s.heap_mb_end || "?") + " MB"],
+      ["JS heap trend", (s.heap_trend && s.heap_trend.measurable)
+        ? s.heap_trend.verdict + ", " + (s.heap_trend.mb_per_min > 0 ? "+" : "") +
+          s.heap_trend.mb_per_min + " MB/min over " + s.heap_trend.span_minutes + " min"
+        : "needs a longer capture"],
       ["Texture data uploaded", s.texture_mb_uploaded + " MB"],
       ["GPU", s.gpu.renderer || "unknown"],
       ["CPU threads / device memory", s.hardware_concurrency + " / " + (s.device_memory_gb || "?") + " GB"],

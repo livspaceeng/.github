@@ -99,10 +99,36 @@ The timeline also marks **frozen** seconds — gaps where the page produced no
 frame at all. These never appear in an average, and they are usually the thing
 users are actually complaining about.
 
-To record for longer, set the duration before pasting:
+### Long captures
+
+Set the duration before pasting the probe:
 
 ```js
-window.__LSPROBE_SECONDS = 600
+window.__LSPROBE_SECONDS = 1800     // 30 minutes
+```
+
+A long capture answers one thing a short one cannot: **whether the JS heap
+plateaus or keeps climbing**. Three minutes shows a number going up and cannot
+tell a working set from a leak. The report needs about five minutes of
+on-screen time before it will call the trend at all, and it reports growth per
+minute of *foreground* time — wall clock would let a spell in the background
+flatten a real leak into a gentle slope.
+
+Other things that only a long run surfaces: whether the worst blocking task
+recurs or fires once, whether frame pacing degrades as the tab ages, and
+whether draw-call counts creep as more of the design is touched.
+
+While it runs it prints a one-line heartbeat to the console every minute, so a
+half-hour capture does not look like a hung tab. Switching away from the tab is
+fine — hidden time is recorded separately and excluded from every ratio.
+
+Label what you are doing as you go; over half an hour this is what makes the
+result readable:
+
+```js
+__lsprobe.mark("orbiting")
+__lsprobe.mark("adding wardrobe")
+__lsprobe.mark("switching to elevation")
 ```
 
 ## What it measures
