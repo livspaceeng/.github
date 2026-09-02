@@ -1,4 +1,4 @@
-# Real-app performance probe
+# Real-app performance tools
 
 Measures **the actual application** — Livspace Parametric / Canvas, Coohom, or
 any WebGL web app — running in **your** browser, on **your** laptop, inside
@@ -8,7 +8,48 @@ The synthetic benchmark in the parent directory tells you what the machine can
 do. This tells you what the app actually achieves on it. For a "can this laptop
 run Parametric?" decision you want both, and this one is the answer.
 
-## How to run it
+## Option A — `parametric-sim.html` (no login, no console, no pasting)
+
+**Double-click the file.** It opens in your browser and runs itself.
+
+A standalone stand-in for a browser-based interior configurator — Livspace
+Parametric, Coohom and the like. Use it when you cannot instrument the real app:
+no login, no DevTools, no IT policy in the way. It sweeps four quality levels,
+about 90 seconds in total, and tells you the heaviest design your machine holds
+at 60 fps and at 30 fps.
+
+What it reproduces, deliberately:
+
+- A room shell plus many separately-drawn furniture modules — 67 draw calls at
+  Low rising to 589 at Ultra. Configurators batch poorly, and that is the point.
+- Textured, specular, normal-perturbed surfaces with three point lights, so
+  fragment cost is realistic rather than a flat colour the GPU shrugs off.
+- A continuously orbiting camera, as a user inspecting a design.
+- An **"add module" edit every 5 seconds**: synchronous geometry generation plus
+  an O(n²) constraint relaxation across every module in the room, on the main
+  thread. This is what makes a configurator feel like it has hung, and because
+  it is O(n²) it gets worse as the design grows — exactly as the real thing does.
+- A live BOQ side panel that re-renders on every change.
+
+It reports mean fps, p95/p99 frame time, jank percentage, worst edit stall, and
+peak JS heap per level, with a GOOD / MARGINAL / POOR verdict, and offers the
+whole thing as a downloadable HTML file.
+
+```
+./parametric-sim.html?secs=30      # longer per level, steadier numbers
+```
+
+### It is a model, not Parametric
+
+It matches the *resource shape* of a configurator — draw-call-heavy, fragment-
+bound, with synchronous main-thread edit spikes. It does not run Livspace's
+actual scene, shaders or asset pipeline, so treat it as a capability test for
+the machine, not a prediction of exact fps in Parametric. For the real thing,
+use Option B.
+
+## Option B — `probe.js` (measures the real app)
+
+### How to run the probe
 
 1. Open the app and log in. Get to the **3D view** with a real design loaded —
    an empty project measures nothing.
