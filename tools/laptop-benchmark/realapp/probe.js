@@ -54,7 +54,25 @@
     running: true,
     raf: null,
     label: "idle",
+    hidden: [],              // [{from, to}] seconds the tab was in the background
+    hiddenSince: null,
   };
+
+  // Chrome stops requestAnimationFrame for a hidden tab. Without this the
+  // resulting gap is indistinguishable from the page hanging, and gets counted
+  // as a freeze it never had.
+  (function trackVisibility() {
+    function now() { return (performance.now() - S.t0) / 1000; }
+    if (document.visibilityState === "hidden") S.hiddenSince = 0;
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "hidden") {
+        S.hiddenSince = now();
+      } else if (S.hiddenSince != null) {
+        S.hidden.push({ from: +S.hiddenSince.toFixed(1), to: +now().toFixed(1) });
+        S.hiddenSince = null;
+      }
+    });
+  })();
 
   /* ------------------------------------------------- WebGL hooking */
   // Patching the prototypes catches contexts that already exist, so this works
@@ -233,15 +251,45 @@
     return { active: active, idle: idle };
   }
 
-  // A gap in the per-second timeline means no frame was produced at all - the
-  // tab was unresponsive. These are invisible in any average.
-  function freezes() {
-    var out = [], b = S.buckets;
-    for (var i = 1; i < b.length; i++) {
-      var gap = b[i].t - b[i - 1].t;
-      if (gap > 2.5) out.push({ from: +b[i - 1].t.toFixed(1), to: +b[i].t.toFixed(1), seconds: +gap.toFixed(1) });
+  // A gap in the per-second timeline means no frame was produced. That is only
+  // a hang if the tab was actually in front of the user AND something was
+  // blocking the main thread - a backgrounded tab produces an identical gap.
+  // Every gap is therefore classified against two independent signals:
+  // the visibility log, and whether a Long Task actually covers it.
+  function classifyGaps() {
+    var hangs = [], hiddenGaps = [], b = S.buckets;
+    if (S.hiddenSince != null) {
+      S.hidden.push({ from: S.hiddenSince, to: (performance.now() - S.t0) / 1000 });
+      S.hiddenSince = null;
     }
-    return out;
+    for (var i = 1; i < b.length; i++) {
+      var from = b[i - 1].t, to = b[i].t, gap = to - from;
+      if (gap <= 2.5) continue;
+      var rec = { from: +from.toFixed(1), to: +to.toFixed(1), seconds: +gap.toFixed(1) };
+
+      var hiddenOverlap = 0;
+      S.hidden.forEach(function (h) {
+        hiddenOverlap += Math.max(0, Math.min(to, h.to) - Math.max(from, h.from));
+      });
+      var blockedMs = 0;
+      S.longTasks.forEach(function (t) {
+        var a = t.t / 1000, z = (t.t + t.ms) / 1000;
+        blockedMs += Math.max(0, Math.min(to, z) - Math.max(from, a)) * 1000;
+      });
+      rec.blocked_ms = Math.round(blockedMs);
+
+      // Visibility decides whether the gap counts at all - it is authoritative.
+      // Long Tasks only attribute the cause, because a gap with no blocking
+      // task is still a real stall to the user; it just came from the renderer
+      // rather than from JavaScript.
+      if (hiddenOverlap > gap * 0.5) {
+        hiddenGaps.push(rec);
+      } else {
+        rec.cause = blockedMs >= gap * 1000 * 0.5 ? "main thread blocked" : "renderer stalled";
+        hangs.push(rec);
+      }
+    }
+    return { hangs: hangs, hidden: hiddenGaps };
   }
 
   function summarise() {
@@ -249,8 +297,13 @@
     var elapsed = (performance.now() - S.t0) / 1000;
     var fpsAll = S.buckets.map(function (b) { return b.fps; });
     var toMs = function (v) { return v == null ? null : +v.toFixed(2); };
-    var sp = split(), fz = freezes();
+    var sp = split(), gaps = classifyGaps();
+    var fz = gaps.hangs;
     var frozenTotal = fz.reduce(function (a, f) { return a + f.seconds; }, 0);
+    var hiddenTotal = gaps.hidden.reduce(function (a, f) { return a + f.seconds; }, 0);
+    // Time the page was actually in front of the user. Every ratio below uses
+    // this, not wall clock, or a long background spell flatters everything.
+    var foreground = Math.max(1, elapsed - hiddenTotal);
 
     var summary = {
       seconds: +elapsed.toFixed(1),
@@ -272,6 +325,9 @@
       idle_seconds: sp.idle.length,
       frozen_seconds: +frozenTotal.toFixed(1),
       freezes: fz,
+      hidden_seconds: +hiddenTotal.toFixed(1),
+      hidden_gaps: gaps.hidden,
+      foreground_seconds: +foreground.toFixed(1),
       worst_freeze_s: fz.length ? Math.max.apply(null, fz.map(function (f) { return f.seconds; })) : 0,
       active_fps_p50: sp.active.length ? +median(sp.active.map(function (b) { return b.fps; })).toFixed(1) : null,
       idle_fps_p50: sp.idle.length ? +median(sp.idle.map(function (b) { return b.fps; })).toFixed(1) : null,
@@ -307,7 +363,7 @@
       config: CONFIG,
     };
     summary.jank_pct = S.frames ? +(100 * summary.jank_frames / S.frames).toFixed(1) : 0;
-    summary.blocked_pct = +(100 * summary.long_task_ms_total / (summary.seconds * 1000)).toFixed(0);
+    summary.blocked_pct = +(100 * summary.long_task_ms_total / (foreground * 1000)).toFixed(0);
     // Submission cost at 2-5 microseconds per WebGL draw call, CPU side.
     summary.submit_ms_low = +(summary.active_draws_per_frame * 0.002).toFixed(1);
     summary.submit_ms_high = +(summary.active_draws_per_frame * 0.005).toFixed(1);
@@ -334,9 +390,14 @@
 
     if (s.frozen_seconds > 5) {
       add("fail", "The page stopped responding",
-        s.frozen_seconds + "s of the " + s.seconds + "s session produced no frames at all, across " +
-        s.freezes.length + " episodes, the longest " + s.worst_freeze_s + "s. These are complete " +
-        "interface freezes and they are invisible in any average frame rate.");
+        s.frozen_seconds + "s of the " + s.foreground_seconds + "s the page was actually on screen " +
+        "produced no frames at all, across " +
+        s.freezes.length + " episodes, the longest " + s.worst_freeze_s + "s" +
+        (s.freezes.length ? " (" + s.freezes.filter(function (f) {
+          return f.cause === "main thread blocked"; }).length + " of them main-thread blocking)" : "") +
+        ". These are complete interface freezes and they are invisible in any average frame rate." +
+        (s.hidden_seconds > 2 ? " A further " + s.hidden_seconds + "s where the tab was in the " +
+        "background is excluded, not counted as a freeze." : ""));
     }
 
     var a = s.active_fps_p50, i = s.idle_fps_p50;
@@ -457,7 +518,10 @@
       ["1% low frame rate", s.fps_p05 + " fps"],
       ["Frame time p50 / p95 / p99", s.frame_ms_p50 + " / " + s.frame_ms_p95 + " / " + s.frame_ms_p99 + " ms"],
       ["Worst frame", s.frame_ms_max + " ms"],
-      ["Time frozen (no frames at all)", s.frozen_seconds + " s of " + s.seconds + " s"],
+      ["Session — foreground / hidden / total", s.foreground_seconds + " / " + s.hidden_seconds +
+        " / " + s.seconds + " s"],
+      ["Time hung (no frames, main thread blocked)", s.frozen_seconds + " s of " +
+        s.foreground_seconds + " s on screen"],
       ["Longest freeze", s.worst_freeze_s + " s"],
       ["Draw calls / frame while rendering", s.active_draws_per_frame.toLocaleString() +
         "  (peak " + s.active_draws_per_frame_max.toLocaleString() + ")"],
@@ -523,7 +587,9 @@
       "</table>" +
       "<p><small>Captured with lsprobe. Per-frame figures are computed only over seconds in which the " +
       "3D view actually drew; averaging those across idle time is what makes a stuttering application " +
-      "look healthy. Raw JSON downloaded alongside this file.</small></p></div>";
+      "look healthy. A gap in the frame timeline counts as a hang only when the tab was on screen and " +
+      "a Long Task covers it - a backgrounded tab produces an identical gap and is excluded. " +
+      "Raw JSON downloaded alongside this file.</small></p></div>";
   }
 
   function download(name, text, type) {
