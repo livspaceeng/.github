@@ -78,9 +78,26 @@ use Option B.
    __lsprobe.mark("switching to elevation")
    ```
 
-6. It stops on its own and downloads two files: an HTML report and the raw
-   JSON. `__lsprobe.stop()` ends it early; `__lsprobe.status()` prints a live
-   summary without stopping.
+6. It stops on its own and downloads two files: a complete HTML report and the
+   raw JSON. `__lsprobe.stop()` ends it early; `__lsprobe.status()` prints a
+   live summary without stopping.
+
+The HTML report is self-contained and needs no further analysis. It carries a
+second-by-second timeline of the session, the frame-budget arithmetic, the
+findings, and the full measurement table.
+
+### Why the report splits idle from rendering
+
+A 3D app only redraws when something changes. Averaging frame rate across the
+seconds where it sat still is what makes a stuttering application look healthy
+— in one real capture the session median read 57 fps while the median *while
+rendering* was 12.8. Every per-frame figure in the report is therefore computed
+only over seconds in which the view actually drew, and the report shows both
+numbers side by side so the gap is visible rather than hidden.
+
+The timeline also marks **frozen** seconds — gaps where the page produced no
+frame at all. These never appear in an average, and they are usually the thing
+users are actually complaining about.
 
 To record for longer, set the duration before pasting:
 

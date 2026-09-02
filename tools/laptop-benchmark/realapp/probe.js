@@ -222,11 +222,36 @@
     return s[lo] + (s[hi] - s[lo]) * (pos - lo);
   }
 
+  function median(a) { return a.length ? pct(a, 50) : null; }
+
+  // Seconds where the 3D view actually drew, versus seconds where the page was
+  // only compositing. Averaging across both is what makes a stuttering app look
+  // healthy, so every per-frame figure below is computed on the active seconds.
+  function split() {
+    var active = S.buckets.filter(function (b) { return b.draws > 0 && b.fps > 0.5; });
+    var idle = S.buckets.filter(function (b) { return b.draws === 0; });
+    return { active: active, idle: idle };
+  }
+
+  // A gap in the per-second timeline means no frame was produced at all - the
+  // tab was unresponsive. These are invisible in any average.
+  function freezes() {
+    var out = [], b = S.buckets;
+    for (var i = 1; i < b.length; i++) {
+      var gap = b[i].t - b[i - 1].t;
+      if (gap > 2.5) out.push({ from: +b[i - 1].t.toFixed(1), to: +b[i].t.toFixed(1), seconds: +gap.toFixed(1) });
+    }
+    return out;
+  }
+
   function summarise() {
     var ft = S.frameTimes;
     var elapsed = (performance.now() - S.t0) / 1000;
     var fpsAll = S.buckets.map(function (b) { return b.fps; });
     var toMs = function (v) { return v == null ? null : +v.toFixed(2); };
+    var sp = split(), fz = freezes();
+    var frozenTotal = fz.reduce(function (a, f) { return a + f.seconds; }, 0);
+
     var summary = {
       seconds: +elapsed.toFixed(1),
       frames: S.frames,
@@ -241,6 +266,24 @@
       jank_frames: ft.filter(function (x) { return x > CONFIG.jankMs; }).length,
       bad_frames: ft.filter(function (x) { return x > CONFIG.badMs; }).length,
       stalls: ft.filter(function (x) { return x > CONFIG.stallMs; }).length,
+
+      // The figures that matter, measured only while the view was rendering.
+      active_seconds: sp.active.length,
+      idle_seconds: sp.idle.length,
+      frozen_seconds: +frozenTotal.toFixed(1),
+      freezes: fz,
+      worst_freeze_s: fz.length ? Math.max.apply(null, fz.map(function (f) { return f.seconds; })) : 0,
+      active_fps_p50: sp.active.length ? +median(sp.active.map(function (b) { return b.fps; })).toFixed(1) : null,
+      idle_fps_p50: sp.idle.length ? +median(sp.idle.map(function (b) { return b.fps; })).toFixed(1) : null,
+      active_draws_per_frame: sp.active.length
+        ? Math.round(median(sp.active.map(function (b) { return b.draws / b.fps; }))) : 0,
+      active_draws_per_frame_max: sp.active.length
+        ? Math.round(Math.max.apply(null, sp.active.map(function (b) { return b.draws / b.fps; }))) : 0,
+      active_tris_per_frame: sp.active.length
+        ? Math.round(median(sp.active.map(function (b) { return b.tris / b.fps; }))) : 0,
+      active_tris_per_frame_max: sp.active.length
+        ? Math.round(Math.max.apply(null, sp.active.map(function (b) { return b.tris / b.fps; }))) : 0,
+
       draw_calls_total: S.drawCalls,
       draw_calls_per_frame: S.frames ? +(S.drawCalls / S.frames).toFixed(1) : 0,
       triangles_per_frame: S.frames ? Math.round(S.triangles / S.frames) : 0,
@@ -251,8 +294,10 @@
       long_task_ms_max: S.longTasks.length
         ? Math.max.apply(null, S.longTasks.map(function (x) { return x.ms; })) : 0,
       long_task_supported: S.longTaskSupported,
+      heap_mb_start: S.buckets.length ? S.buckets[0].heapMb : null,
       heap_mb_peak: Math.max.apply(null, [0].concat(
         S.buckets.map(function (b) { return b.heapMb || 0; }))) || null,
+      heap_mb_end: S.buckets.length ? S.buckets[S.buckets.length - 1].heapMb : null,
       device_pixel_ratio: window.devicePixelRatio,
       hardware_concurrency: navigator.hardwareConcurrency,
       device_memory_gb: navigator.deviceMemory || null,
@@ -262,14 +307,19 @@
       config: CONFIG,
     };
     summary.jank_pct = S.frames ? +(100 * summary.jank_frames / S.frames).toFixed(1) : 0;
+    summary.blocked_pct = +(100 * summary.long_task_ms_total / (summary.seconds * 1000)).toFixed(0);
+    // Submission cost at 2-5 microseconds per WebGL draw call, CPU side.
+    summary.submit_ms_low = +(summary.active_draws_per_frame * 0.002).toFixed(1);
+    summary.submit_ms_high = +(summary.active_draws_per_frame * 0.005).toFixed(1);
+    summary.frame_budget_ms = 16.7;
     summary.software_rendered = !!(summary.gpu.renderer &&
-      /swiftshader|llvmpipe|software|angle \(google/i.test(summary.gpu.renderer));
+      /swiftshader|llvmpipe|software|basic render/i.test(summary.gpu.renderer));
     return summary;
   }
 
   function verdict(s) {
-    var f = [], sev = { ok: 0, warn: 0, fail: 0 };
-    function add(level, title, detail) { f.push({ level: level, title: title, detail: detail }); sev[level]++; }
+    var f = [];
+    function add(level, title, detail) { f.push({ level: level, title: title, detail: detail }); }
 
     if (!s.frames) {
       add("fail", "No frames captured",
@@ -279,160 +329,201 @@
     if (s.software_rendered) {
       add("fail", "Not using the GPU",
         "The renderer reports as " + s.gpu.renderer + ". Chrome is falling back to software " +
-        "rendering, which is why it is slow. Check chrome://gpu - hardware acceleration is " +
-        "off or blocklisted. Fix this before judging the laptop.");
+        "rendering. Check chrome://gpu and fix hardware acceleration before judging anything else here.");
     }
 
-    var fps = s.fps_p50;
-    if (fps >= 50) add("ok", "Frame rate is smooth", "Median " + fps + " fps, 1% low " + s.fps_p05 + ".");
-    else if (fps >= 30) add("warn", "Frame rate is usable but not smooth",
-      "Median " + fps + " fps, 1% low " + s.fps_p05 + ". Orbiting will feel heavy.");
-    else if (fps >= 20) add("warn", "Frame rate is poor",
-      "Median " + fps + " fps, 1% low " + s.fps_p05 + ". Interaction will feel sluggish.");
-    else add("fail", "Frame rate is unusable",
-      "Median " + fps + " fps, 1% low " + s.fps_p05 + ".");
+    if (s.frozen_seconds > 5) {
+      add("fail", "The page stopped responding",
+        s.frozen_seconds + "s of the " + s.seconds + "s session produced no frames at all, across " +
+        s.freezes.length + " episodes, the longest " + s.worst_freeze_s + "s. These are complete " +
+        "interface freezes and they are invisible in any average frame rate.");
+    }
 
-    if (s.frame_ms_p99 > 200) add("fail", "Severe frame stalls",
-      "The worst 1% of frames took " + s.frame_ms_p99 + " ms (peak " + s.frame_ms_max +
-      " ms). These are the freezes users complain about.");
-    else if (s.frame_ms_p95 > 50) add("warn", "Inconsistent frame pacing",
-      "95th-percentile frame time " + s.frame_ms_p95 + " ms. Motion will stutter even if the average looks fine.");
-    else add("ok", "Frame pacing is consistent", "95th-percentile frame time " + s.frame_ms_p95 + " ms.");
+    var a = s.active_fps_p50, i = s.idle_fps_p50;
+    if (a != null && i != null && i - a > 20) {
+      add("warn", "Smooth until it has to draw",
+        "Idle the page composites at " + i + " fps; while the 3D view redraws it manages " + a +
+        " fps. The session median of " + s.fps_p50 + " fps is an artefact of counting the idle time.");
+    } else if (a != null && a >= 50) {
+      add("ok", "Frame rate holds while rendering", "Median " + a + " fps with the view live.");
+    } else if (a != null) {
+      add(a < 24 ? "fail" : "warn", "Frame rate is low while rendering", "Median " + a + " fps.");
+    }
+
+    if (s.submit_ms_low > s.frame_budget_ms) {
+      add("fail", "Draw-call submission alone exceeds the frame budget",
+        s.active_draws_per_frame.toLocaleString() + " draw calls per frame at roughly 2-5 microseconds " +
+        "each is " + s.submit_ms_low + "-" + s.submit_ms_high + " ms of CPU work per frame, against a " +
+        s.frame_budget_ms + " ms budget at 60 fps - before the GPU draws anything. This is a batching " +
+        "problem in the application; faster hardware cannot close a gap this size.");
+    } else if (s.active_draws_per_frame > 2000) {
+      add("warn", "High draw-call count",
+        s.active_draws_per_frame.toLocaleString() + " draw calls per frame. CPU-side, and worth batching.");
+    } else if (s.active_draws_per_frame) {
+      add("ok", "Draw-call count is reasonable", s.active_draws_per_frame.toLocaleString() + " per frame.");
+    }
+
+    var canvas = (s.gpu.canvases || []).filter(function (c) { return c.webgl && c.w > 100; })[0];
+    if (s.active_tris_per_frame > 3000000 && canvas) {
+      var px = canvas.w * canvas.h;
+      add("warn", "Scene is drawn without effective culling",
+        (s.active_tris_per_frame / 1e6).toFixed(1) + "M triangles per frame for a " + canvas.w + "x" +
+        canvas.h + " buffer is about " + (s.active_tris_per_frame / px).toFixed(0) + " triangles per pixel. " +
+        "Most of that geometry is off-screen or sub-pixel. Frustum culling and level-of-detail would cut it.");
+    }
 
     if (s.long_task_supported) {
-      var blockedPct = 100 * s.long_task_ms_total / (s.seconds * 1000);
-      if (blockedPct > 30) add("fail", "Main thread is saturated",
-        "Blocked for " + blockedPct.toFixed(0) + "% of the session across " + s.long_tasks +
-        " long tasks (worst " + s.long_task_ms_max + " ms). Clicks and typing will lag. " +
-        "This is application JavaScript, not the GPU - a faster laptop helps less than you would expect.");
-      else if (blockedPct > 10) add("warn", "Main thread often blocked",
-        "Blocked for " + blockedPct.toFixed(0) + "% of the session, worst single task " +
-        s.long_task_ms_max + " ms.");
-      else add("ok", "Main thread stays responsive",
-        "Blocked for only " + blockedPct.toFixed(0) + "% of the session.");
+      if (s.blocked_pct > 30) add("fail", "Main thread is saturated",
+        "Blocked for " + s.blocked_pct + "% of the session across " + s.long_tasks + " long tasks, " +
+        "worst single task " + (s.long_task_ms_max / 1000).toFixed(1) + "s. While a long task runs " +
+        "nothing happens - no frames, no clicks, no typing. This is application JavaScript.");
+      else if (s.blocked_pct > 10) add("warn", "Main thread often blocked",
+        "Blocked " + s.blocked_pct + "% of the session, worst task " +
+        (s.long_task_ms_max / 1000).toFixed(1) + "s.");
+      else add("ok", "Main thread stays responsive", "Blocked only " + s.blocked_pct + "% of the session.");
     }
 
-    if (s.draw_calls_per_frame > 2000) add("warn", "Very high draw-call count",
-      s.draw_calls_per_frame + " draw calls per frame. This is a CPU-side bottleneck in the app " +
-      "(batching), not a GPU limit.");
-    else if (s.draw_calls_per_frame > 0) add("ok", "Draw-call count is reasonable",
-      s.draw_calls_per_frame + " draw calls per frame, " +
-      (s.triangles_per_frame / 1e6).toFixed(2) + "M triangles.");
+    if (s.heap_mb_start && s.heap_mb_peak && s.heap_mb_peak - s.heap_mb_start > 400)
+      add("warn", "JS heap grew sharply",
+        Math.round(s.heap_mb_start) + " MB to a peak of " + Math.round(s.heap_mb_peak) + " MB in " +
+        s.seconds + "s. Worth a longer recording to see whether it plateaus or keeps climbing.");
 
-    if (s.heap_mb_peak && s.heap_mb_peak > 2000) add("warn", "Very large JS heap",
-      "Peak " + s.heap_mb_peak + " MB. Close to Chrome's per-tab ceiling; a bigger design may crash the tab.");
-    else if (s.heap_mb_peak) add("ok", "JS heap is within budget", "Peak " + s.heap_mb_peak + " MB.");
-
-    if (s.device_pixel_ratio >= 2 && s.gpu.canvases.length) {
-      var c = s.gpu.canvases.filter(function (x) { return x.webgl; })[0];
-      if (c && c.w >= 3000) add("warn", "Rendering at full Retina resolution",
-        "The 3D canvas is " + c.w + "x" + c.h + " backing pixels. Halving the render scale is " +
-        "usually the single biggest win available, at little visual cost.");
-    }
+    if (s.device_pixel_ratio >= 2 && canvas && canvas.w >= 1800)
+      add("warn", "Rendering at full Retina resolution",
+        "The 3D canvas is " + canvas.w + "x" + canvas.h + " backing pixels. Halving the render scale is " +
+        "usually the cheapest large win available.");
 
     var order = { fail: 0, warn: 1, ok: 2 };
-    f.sort(function (a, b) { return order[a.level] - order[b.level]; });
-    return { findings: f, overall: sev.fail ? "fail" : (sev.warn ? "warn" : "ok") };
+    f.sort(function (x, y) { return order[x.level] - order[y.level]; });
+    return { findings: f,
+             overall: f.some(function (x) { return x.level === "fail"; }) ? "fail"
+                    : f.some(function (x) { return x.level === "warn"; }) ? "warn" : "ok" };
   }
 
-  /* ------------------------------------------------ HTML rendering */
-  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  /* ---------- report rendering ---------- */
 
-  function chart(buckets, key, label, colour, ymaxHint) {
-    if (!buckets.length) return "<p>no data</p>";
-    var W = 860, H = 180, PL = 48, PR = 12, PT = 12, PB = 26;
-    var xs = buckets.map(function (b) { return b.t; });
-    var ys = buckets.map(function (b) { return b[key] || 0; });
-    var xmax = Math.max.apply(null, xs) || 1;
-    var ymax = Math.max(ymaxHint || 0, Math.max.apply(null, ys)) * 1.1 || 1;
-    var X = function (v) { return PL + (W - PL - PR) * (v / xmax); };
-    var Y = function (v) { return PT + (H - PT - PB) * (1 - v / ymax); };
-    var d = buckets.map(function (b, i) {
-      return (i ? "L" : "M") + X(b.t).toFixed(1) + "," + Y(b[key] || 0).toFixed(1); }).join(" ");
-    var out = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%">'];
-    for (var i = 0; i <= 4; i++) {
-      var y = PT + (H - PT - PB) * i / 4;
-      out.push('<line x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '" class="g"/>');
-      out.push('<text x="' + (PL - 6) + '" y="' + (y + 4) + '" class="tk" text-anchor="end">' +
-        (ymax * (1 - i / 4)).toFixed(ymax < 10 ? 1 : 0) + "</text>");
+  function esc(t) {
+    return String(t).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; });
+  }
+
+  // One cell per second, classified: idle / rendering / frozen. This single
+  // strip communicates more than any average in the table below it.
+  function timeline(s) {
+    var N = Math.ceil(s.seconds), W = 900, L = 8, R = 8, TOP = 30, H = 46;
+    var state = [], fps = [];
+    for (var k = 0; k < N; k++) { state.push("f"); fps.push(0); }
+    S.buckets.forEach(function (b) {
+      var t = Math.floor(b.t);
+      if (t >= 0 && t < N) { state[t] = b.draws > 0 ? "r" : "s"; fps[t] = Math.round(b.fps); }
+    });
+    var cw = (W - L - R) / N;
+    var fill = { s: "#0B7D63", r: "#A87400", f: "url(#hz)" };
+    var out = ['<svg viewBox="0 0 ' + W + ' ' + (TOP + H + 26) + '" style="width:100%;height:auto" ' +
+      'role="img" aria-label="Per-second state of the session">',
+      '<defs><pattern id="hz" width="6" height="6" patternTransform="rotate(45)" ' +
+      'patternUnits="userSpaceOnUse"><rect width="6" height="6" fill="#9E1F17"></rect>' +
+      '<line x1="0" y1="0" x2="0" y2="6" stroke="#fff" stroke-width="2.2"></line></pattern></defs>'];
+    for (var i = 0; i < N; i++) {
+      out.push('<rect x="' + (L + i * cw).toFixed(2) + '" y="' + TOP + '" width="' +
+        Math.max(0.8, cw - 0.6).toFixed(2) + '" height="' + H + '" fill="' + fill[state[i]] +
+        '"><title>' + i + 's — ' + ({ s: "idle", r: "rendering", f: "frozen, no frames" })[state[i]] +
+        (state[i] === "f" ? "" : " " + fps[i] + " fps") + '</title></rect>');
     }
-    if (key === "fps" && ymax > 30)
-      out.push('<line x1="' + PL + '" y1="' + Y(30) + '" x2="' + (W - PR) + '" y2="' + Y(30) +
-        '" stroke="#cf222e" stroke-dasharray="4 3" stroke-width="1"/>');
-    out.push('<path d="' + d + '" fill="none" stroke="' + colour + '" stroke-width="1.8"/>');
-    for (var j = 0; j <= 4; j++) {
-      var x = PL + (W - PL - PR) * j / 4;
-      out.push('<text x="' + x + '" y="' + (H - 6) + '" class="tk" text-anchor="middle">' +
-        (xmax * j / 4).toFixed(0) + "s</text>");
+    var step = N > 120 ? 30 : N > 60 ? 20 : 10;
+    for (var t2 = 0; t2 <= N; t2 += step) {
+      var x = L + t2 * cw;
+      out.push('<text x="' + x.toFixed(1) + '" y="' + (TOP + H + 17) + '" fill="#59636e" ' +
+        'font-family="ui-monospace,monospace" font-size="11" text-anchor="' +
+        (t2 === 0 ? "start" : "middle") + '">' + t2 + 's</text>');
     }
-    out.push('<text x="4" y="' + (PT + 8) + '" class="tk">' + esc(label) + "</text></svg>");
+    out.push("</svg>");
+    var counts = { s: 0, r: 0, f: 0 };
+    state.forEach(function (c) { counts[c]++; });
+    out.push('<div class="lg">' +
+      '<span><i style="background:#0B7D63"></i>Idle, compositing <b>' + counts.s + ' s</b></span>' +
+      '<span><i style="background:#A87400"></i>Rendering the 3D view <b>' + counts.r + ' s</b></span>' +
+      '<span><i style="background:#9E1F17"></i>Frozen, no frames <b>' + counts.f + ' s</b></span></div>');
     return out.join("");
   }
 
   function buildHtml(s, v) {
-    var badge = { ok: ["PASS", "#1a7f37"], warn: ["MARGINAL", "#9a6700"], fail: ["FAIL", "#cf222e"] }[v.overall];
+    var badge = { ok: ["GOOD", "#1a7f37"], warn: ["MARGINAL", "#9a6700"], fail: ["POOR", "#cf222e"] }[v.overall];
+    var canvas = (s.gpu.canvases || []).filter(function (c) { return c.webgl && c.w > 100; })[0];
     var rows = [
-      ["Median frame rate", s.fps_p50 + " fps"],
+      ["While rendering — median frame rate", s.active_fps_p50 + " fps"],
+      ["While idle — median frame rate", s.idle_fps_p50 + " fps"],
+      ["Whole-session median (diluted by idle)", s.fps_p50 + " fps"],
       ["1% low frame rate", s.fps_p05 + " fps"],
       ["Frame time p50 / p95 / p99", s.frame_ms_p50 + " / " + s.frame_ms_p95 + " / " + s.frame_ms_p99 + " ms"],
       ["Worst frame", s.frame_ms_max + " ms"],
-      ["Janky frames (>33ms)", s.jank_frames + " (" + s.jank_pct + "%)"],
-      ["Freezes (>250ms)", String(s.stalls)],
-      ["Main-thread long tasks", s.long_task_supported
-        ? s.long_tasks + ", " + s.long_task_ms_total + " ms total, worst " + s.long_task_ms_max + " ms"
-        : "not supported in this browser"],
-      ["Draw calls per frame", String(s.draw_calls_per_frame)],
-      ["Triangles per frame", (s.triangles_per_frame / 1e6).toFixed(2) + "M"],
+      ["Time frozen (no frames at all)", s.frozen_seconds + " s of " + s.seconds + " s"],
+      ["Longest freeze", s.worst_freeze_s + " s"],
+      ["Draw calls / frame while rendering", s.active_draws_per_frame.toLocaleString() +
+        "  (peak " + s.active_draws_per_frame_max.toLocaleString() + ")"],
+      ["Triangles / frame while rendering", (s.active_tris_per_frame / 1e6).toFixed(2) + " M" +
+        "  (peak " + (s.active_tris_per_frame_max / 1e6).toFixed(2) + " M)"],
+      ["Main thread blocked", s.long_task_supported
+        ? s.blocked_pct + "% — " + s.long_tasks + " long tasks, worst " +
+          (s.long_task_ms_max / 1000).toFixed(1) + " s" : "not supported"],
+      ["JS heap start / peak / end", (s.heap_mb_start || "?") + " / " + Math.round(s.heap_mb_peak || 0) +
+        " / " + (s.heap_mb_end || "?") + " MB"],
       ["Texture data uploaded", s.texture_mb_uploaded + " MB"],
-      ["Geometry data uploaded", s.buffer_mb_uploaded + " MB"],
-      ["Peak JS heap", s.heap_mb_peak ? s.heap_mb_peak + " MB" : "n/a"],
-      ["GPU", (s.gpu.renderer || "unknown")],
-      ["Canvas backing size", s.gpu.canvases.filter(function (c) { return c.webgl; })
-        .map(function (c) { return c.w + "x" + c.h; }).join(", ") || "n/a"],
-      ["Device pixel ratio", String(s.device_pixel_ratio)],
-      ["CPU threads reported", String(s.hardware_concurrency)],
-      ["Session length", s.seconds + " s, " + s.frames + " frames"],
+      ["GPU", s.gpu.renderer || "unknown"],
+      ["CPU threads / device memory", s.hardware_concurrency + " / " + (s.device_memory_gb || "?") + " GB"],
+      ["Canvas backing store", canvas ? canvas.w + " x " + canvas.h + " at DPR " + s.device_pixel_ratio : "n/a"],
     ];
-    var labels = {};
-    s.__buckets.forEach(function (b) { labels[b.label] = (labels[b.label] || 0) + 1; });
 
-    return "<!doctype html><meta charset='utf-8'><title>Real-app performance - " +
-      esc(s.url) + "</title><style>" +
-      "body{margin:0;background:#fff;color:#1f2328;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}" +
-      "@media(prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}" +
-      ".card{background:#151b23!important;border-color:#3d444d!important}td,th{border-color:#3d444d!important}}" +
-      ".w{max-width:940px;margin:0 auto;padding:36px 22px 70px}h1{font-size:24px;margin:0 0 4px}" +
-      "h2{font-size:17px;margin:32px 0 10px;border-bottom:1px solid #d1d9e0;padding-bottom:6px}" +
-      ".card{background:#f6f8fa;border:1px solid #d1d9e0;border-radius:10px;padding:14px;margin:12px 0}" +
-      ".bg{display:inline-block;color:#fff;font-weight:700;padding:6px 14px;border-radius:999px}" +
+    return "<!doctype html><meta charset='utf-8'><title>Real-app performance report</title>" +
+      "<style>" +
+      "body{margin:0;background:#fff;color:#1f2328;font:15px/1.6 -apple-system,BlinkMacSystemFont," +
+      "'Segoe UI',Helvetica,sans-serif}" +
+      ".w{max-width:900px;margin:0 auto;padding:40px 24px 80px}" +
+      "h1{font-size:25px;margin:0 0 6px}h2{font-size:17px;margin:34px 0 10px;" +
+      "border-bottom:1px solid #d1d9e0;padding-bottom:6px}" +
+      ".bg{display:inline-block;color:#fff;font-weight:700;padding:6px 15px;border-radius:99px}" +
+      ".card{background:#f6f8fa;border:1px solid #d1d9e0;border-radius:8px;padding:16px;margin:14px 0}" +
+      ".lg{display:flex;gap:20px;flex-wrap:wrap;font-size:12.5px;color:#59636e;margin-top:10px}" +
+      ".lg i{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;" +
+      "vertical-align:-1px}.lg b{color:#1f2328}" +
       "table{border-collapse:collapse;width:100%;font-size:14px}" +
-      "td,th{text-align:left;padding:7px 10px;border-bottom:1px solid #d1d9e0}" +
-      "td:last-child{font-variant-numeric:tabular-nums}" +
-      ".f{display:flex;gap:11px;padding:11px 0;border-bottom:1px solid #d1d9e0}" +
-      ".t{font-size:11px;font-weight:700;color:#fff;padding:3px 8px;border-radius:5px;height:fit-content;min-width:50px;text-align:center}" +
-      ".g{stroke:#d1d9e0}.tk{fill:#59636e;font-size:10px}small{color:#59636e}</style>" +
-      "<div class='w'><h1>Real-app performance report</h1>" +
-      "<p><small>" + esc(s.url) + "<br>" + esc(s.user_agent) + "<br>" + new Date().toString() + "</small></p>" +
+      "td,th{text-align:left;padding:8px 11px;border-bottom:1px solid #d1d9e0}" +
+      "th{color:#59636e;font-size:11px;letter-spacing:.08em;text-transform:uppercase}" +
+      "td:last-child{font-variant-numeric:tabular-nums;white-space:nowrap}" +
+      ".f{display:flex;gap:11px;padding:11px 0;border-bottom:1px solid #eaeef2}" +
+      ".tag{font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;color:#fff;" +
+      "min-width:48px;text-align:center;height:fit-content}" +
+      ".math{font-family:ui-monospace,monospace;font-size:14px;line-height:2}" +
+      ".math div{display:flex;justify-content:space-between;gap:24px}" +
+      ".math .tot{border-top:1px solid #d1d9e0;margin-top:8px;padding-top:8px;color:#cf222e;font-weight:600}" +
+      "small{color:#59636e}</style><div class='w'>" +
+      "<h1>Real-app performance report</h1>" +
+      "<p><small>" + esc(s.url) + "<br>" + new Date().toString() + "<br>" + esc(s.user_agent) + "</small></p>" +
       "<p><span class='bg' style='background:" + badge[1] + "'>" + badge[0] + "</span></p>" +
+
+      "<h2>The session, second by second</h2><div class='card'>" + timeline(s) + "</div>" +
+
       "<h2>Findings</h2>" + v.findings.map(function (f) {
         var c = { ok: "#1a7f37", warn: "#9a6700", fail: "#cf222e" }[f.level];
         var n = { ok: "PASS", warn: "WARN", fail: "FAIL" }[f.level];
-        return "<div class='f'><span class='t' style='background:" + c + "'>" + n +
+        return "<div class='f'><span class='tag' style='background:" + c + "'>" + n +
           "</span><span><b>" + esc(f.title) + "</b><br><small>" + esc(f.detail) + "</small></span></div>";
       }).join("") +
-      "<h2>Measurements</h2><table>" + rows.map(function (r) {
-        return "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td></tr>"; }).join("") + "</table>" +
-      "<h2>Frame rate over time</h2><div class='card'>" +
-      chart(s.__buckets, "fps", "fps", "#1f883d", 60) + "</div>" +
-      "<h2>Frame time p95</h2><div class='card'>" +
-      chart(s.__buckets, "p95", "ms", "#bf3989") + "</div>" +
-      "<h2>Draw calls per second</h2><div class='card'>" +
-      chart(s.__buckets, "draws", "calls", "#0969da") + "</div>" +
-      (s.heap_mb_peak ? "<h2>JS heap</h2><div class='card'>" +
-        chart(s.__buckets, "heapMb", "MB", "#8250df") + "</div>" : "") +
-      "<h2>Activity labels</h2><p>" + esc(JSON.stringify(labels)) + "</p>" +
-      "<p><small>Generated by lsprobe. Raw JSON downloaded alongside this file.</small></p></div>";
+
+      (s.active_draws_per_frame ? "<h2>Where the frame budget goes</h2><div class='card math'>" +
+        "<div><span>Frame budget at 60 fps</span><span>" + s.frame_budget_ms + " ms</span></div>" +
+        "<div><span>Draw calls per frame while rendering</span><span>" +
+        s.active_draws_per_frame.toLocaleString() + "</span></div>" +
+        "<div><span>Cost per WebGL draw call, CPU side</span><span>~2-5 us</span></div>" +
+        "<div class='tot'><span>Submission alone, before any GPU work</span><span>" +
+        s.submit_ms_low + " - " + s.submit_ms_high + " ms</span></div></div>" : "") +
+
+      "<h2>Measurements</h2><table><tr><th>Measurement</th><th>Value</th></tr>" +
+      rows.map(function (r) { return "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td></tr>"; }).join("") +
+      "</table>" +
+      "<p><small>Captured with lsprobe. Per-frame figures are computed only over seconds in which the " +
+      "3D view actually drew; averaging those across idle time is what makes a stuttering application " +
+      "look healthy. Raw JSON downloaded alongside this file.</small></p></div>";
   }
 
   function download(name, text, type) {
